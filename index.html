@@ -55,7 +55,7 @@
     tint: [1.0, 0.12, 0.03]   // accretion disk base colour
   };
 
-  // Compiled as constants when no saved look or debug mode is active.
+  // Compiled as constants when debug mode is off.
   const LOOK = {
     // --- Characters ---
     ramp: ' .:-~=+*xoO%#@',   // glyphs ordered dim -> bright
@@ -73,7 +73,7 @@
     diskOuterFadeStart: 0.5,  // outer fade begins at this fraction of diskOuter
 
     // --- Disk motion & texture ---
-    diskSpin: 0.99,           // base angular speed at the inner edge
+    diskSpin: -0.99,          // base angular speed at the inner edge
     keplerPower: 0,           // how much faster the inside spins (1.5 = Keplerian)
     diskWhirl: 0.05,          // spiral winding of the disk texture
     noiseScaleA: [14.6, 7.65], // coarse swirl: [angular, radial] frequency
@@ -87,7 +87,7 @@
 
     // --- Lensed halo (far side of the disk bent over/under the hole) ---
     haloWidth: 0.85,          // thickness (x Rs)
-    haloSpin: 0.44,           // rotation speed
+    haloSpin: -0.44,          // rotation speed
     haloNoiseScale: [3.0, 4.0],
     haloNoiseFloor: 0.4,      // minimum brightness of the halo swirls
     haloBottom: 0.3,          // brightness under the hole (top = 1)
@@ -125,10 +125,7 @@
   const timeWrap = 21600; // seconds before time wraps (keeps float precision)
   const currentSettings = { cfg, LOOK, position };
   const defaults = JSON.stringify(currentSettings);
-  const storageKey = `ascii-black-hole:look:v1:${location.pathname}`;
-  let settingsNotice = '';
-  let hasSavedSettings = loadSettings();
-  const liveLook = debug || hasSavedSettings;
+  const liveLook = debug;
 
   const layoutKeys = ['fontSize', 'glyphScale', 'charAspect', 'fontWeight', 'font', 'ramp'];
   const lookUniforms = Object.keys(LOOK).filter((key) =>
@@ -161,45 +158,6 @@
         if (Array.isArray(value)) target[key].splice(0, value.length, ...value);
         else target[key] = value;
       }
-    }
-  }
-
-  function validateSettings(settings) {
-    const { cfg: savedCfg, LOOK: savedLook, position: savedPosition } = settings ?? {};
-    for (const [saved, original] of [[savedCfg, cfg], [savedLook, LOOK], [savedPosition, position]]) {
-      if (!saved || typeof saved !== 'object') throw new Error('Missing settings group.');
-      for (const [key, value] of Object.entries(original)) {
-        if (Array.isArray(value) && (!Array.isArray(saved[key]) || saved[key].length !== value.length))
-          throw new Error(`Invalid settings array: ${key}.`);
-      }
-    }
-    if (!Array.isArray(savedPosition) || savedPosition.length !== 2) throw new Error('Invalid position.');
-    for (const [path, , min, max] of Object.values(tunerGroups()).flat()) {
-      const [target, key] = getBinding(path, settings);
-      const value = target[key];
-      const values = min === undefined ? value : [path === 'fontWeight' && value === 'bold' ? 700 : value];
-      if (values.some((n) => !Number.isFinite(n) || n < (min ?? 0) || n > (max ?? 1)))
-        throw new Error(`Invalid setting: ${path}.`);
-    }
-    const error = textSettingsError(savedLook.ramp, savedLook.starGlyphs, savedLook.font);
-    if (error) throw new Error(error);
-    if (savedLook.diskInner >= savedLook.diskOuter || savedLook.starGlyphCuts[0] > savedLook.starGlyphCuts[1])
-      throw new Error('Saved disk radii or star thresholds are out of order.');
-  }
-
-  function loadSettings() {
-    try {
-      const stored = localStorage.getItem(storageKey);
-      if (stored === null) return false;
-      const settings = JSON.parse(stored);
-      validateSettings(settings);
-      applySettings(settings);
-      settingsNotice = 'Loaded saved settings.';
-      return true;
-    } catch (error) {
-      console.warn('Could not load black hole settings:', error);
-      settingsNotice = 'Could not load saved settings. Using defaults.';
-      return false;
     }
   }
 
@@ -553,8 +511,6 @@
   }
 
   window.livelyPropertyListener = (name, val) => {
-    // Lively sends its own property values on startup; don't overwrite a saved look.
-    if (hasSavedSettings) return;
     switch (name) {
       case 'fps': cfg.fps = Math.max(5, +val); break;
       case 'fontSize': cfg.fontSize = Math.max(6, +val); needsLayout = true; break;
@@ -660,19 +616,18 @@
     panel.innerHTML = `
       <header>
         <strong class="grab" title="Drag to move the panel">Black hole tuner</strong>
-        <button type="button" class="save">Save</button>
+        <button type="button" class="export">Export</button>
         <button type="button" class="reset">Defaults</button>
         <button type="button" class="toggle" aria-expanded="true" aria-controls="tuner-controls">Hide</button>
       </header>
       <div class="controls" id="tuner-controls">
         <p>Drag the title to move the panel. Sliders update the scene live. Radii are in shadow radii unless noted.</p>
-        <p>Save keeps the current look in this browser. Defaults removes the saved look.</p>
+        <p>Export logs the current look as JSON to the browser console (F12). Paste it over the defaults in this file. Defaults resets the sliders to the values in this file.</p>
       </div>
       <p class="settings-status" role="status"></p>`;
     document.body.append(panel);
     const controls = panel.querySelector('.controls');
     const settingsStatus = panel.querySelector('.settings-status');
-    settingsStatus.textContent = settingsNotice;
     const refresh = [];
     let resetText;
 
@@ -758,16 +713,9 @@
       }
     }
 
-    panel.querySelector('.save').addEventListener('click', () => {
-      try {
-        validateSettings(currentSettings);
-        localStorage.setItem(storageKey, JSON.stringify(currentSettings));
-        hasSavedSettings = true;
-        settingsStatus.textContent = 'Saved. This look will load automatically.';
-      } catch (error) {
-        console.warn('Could not save black hole settings:', error);
-        settingsStatus.textContent = `Could not save settings. ${error.message}`;
-      }
+    panel.querySelector('.export').addEventListener('click', () => {
+      console.log(JSON.stringify({ cfg, LOOK }, null, 2));
+      settingsStatus.textContent = 'Exported to the console (F12).';
     });
 
     panel.querySelector('.reset').addEventListener('click', () => {
@@ -777,14 +725,7 @@
       needsLayout = true;
       refresh.forEach((update) => update());
       resetText();
-      try {
-        localStorage.removeItem(storageKey);
-        hasSavedSettings = false;
-        settingsStatus.textContent = 'Defaults restored and saved look removed.';
-      } catch (error) {
-        console.warn('Could not remove saved black hole settings:', error);
-        settingsStatus.textContent = 'Defaults restored for now, but the saved look could not be removed.';
-      }
+      settingsStatus.textContent = 'Defaults restored.';
     });
 
     const toggle = panel.querySelector('.toggle');
