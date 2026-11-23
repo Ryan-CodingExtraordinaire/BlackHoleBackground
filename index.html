@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Black Hole</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #tuner {
+    position: fixed; top: 12px; left: 12px; box-sizing: border-box;
+    width: min(320px, calc(100vw - 24px)); max-height: calc(100vh - 24px);
+    display: flex; flex-direction: column; color: #f9f0e9; background: #171316f5;
+    border: 1px solid #73564d; border-radius: 10px; overflow: hidden;
+    font: 14px/1.35 system-ui, sans-serif; color-scheme: dark;
+  }
+  #tuner header { display: flex; align-items: center; border-bottom: 1px solid #4d3a35; }
+  #tuner .grab { flex: 1; padding: 10px 12px; cursor: grab; touch-action: none; user-select: none; }
+  #tuner .grab:active { cursor: grabbing; }
+  #tuner button { margin: 6px; cursor: pointer; }
+  #tuner .controls { max-height: 65vh; overflow-y: auto; overscroll-behavior: contain; padding: 8px 12px; }
+  #tuner p { margin: 0 0 8px; color: #d7c3ba; }
+  #tuner .settings-status { margin: 0; padding: 6px 12px; color: #ffbf9b; }
+  #tuner .settings-status:empty { padding: 0; }
+  #tuner details { border-top: 1px solid #4d3a35; padding: 6px 0; }
+  #tuner summary { cursor: pointer; font-weight: 600; }
+  #tuner label { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; margin: 8px 0; }
+  #tuner input { grid-column: 1 / -1; margin: 0; min-width: 0; accent-color: #ff9a61; }
+  #tuner output { color: #ffbf9b; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  //  set debug mode for the live appearance controls.
+  const debug = false;
+
+  // =====================================================================
+  //  HAND-TWEAKABLE SETTINGS
+  //  Lengths are relative to the shadow radius (Rs) unless noted.
+  //  Colours are [r, g, b] in 0..1.
+  // =====================================================================
+
+  // Live settings: Lively's properties panel can override these at runtime.
+  const cfg = {
+    fps: 30,                  // frame cap
+    fontSize: 7.5,            // CSS px per character row
+    speed: 2.74,              // disk rotation speed multiplier
+    stars: 0.025,             // probability that a cell holds a star (0..1)
+    tilt: 0.24,               // disk inclination (0 = edge-on, 1 = face-on)
+    size: 1.08,               // black hole scale multiplier
+    tint: [1.0, 0.12, 0.03]   // accretion disk base colour
+  };
+
+  // Compiled as constants when no saved look or debug mode is active.
+  const LOOK = {
+    // --- Characters ---
+    ramp: ' .:-~=+*xoO%#@',   // glyphs ordered dim -> bright
+    starGlyphs: '.+*',        // glyphs used for faint / medium / bright stars (must exist in ramp)
+    font: 'Consolas, "Courier New", monospace',
+    fontWeight: 600,
+    glyphScale: 0.9,          // glyph height as a fraction of row height
+    charAspect: 0.56,         // character width / height
+
+    // --- Geometry ---
+    shadowRadius: 0.12,       // Rs, as a fraction of the shorter screen side
+    diskInner: 1.65,          // inner disk edge (x Rs)
+    diskOuter: 4.7,           // outer disk edge (x Rs)
+    diskInnerSoftness: 0.12,  // inner edge fade width (fraction of inner radius)
+    diskOuterFadeStart: 0.5,  // outer fade begins at this fraction of diskOuter
+
+    // --- Disk motion & texture ---
+    diskSpin: 0.99,           // base angular speed at the inner edge
+    keplerPower: 0,           // how much faster the inside spins (1.5 = Keplerian)
+    diskWhirl: 0.05,          // spiral winding of the disk texture
+    noiseScaleA: [14.6, 7.65], // coarse swirl: [angular, radial] frequency
+    noiseScaleB: [1.1, 3.2],  // fine swirl:   [angular, radial] frequency
+    noiseMixA: 0.05,          // weight of coarse vs. fine swirl (fine = 1 - this)
+    clumpFloor: 0.56,         // minimum brightness of the gaps between swirls
+    clumpGain: 0.84,          // brightness added by the swirls
+    heatFalloff: 0.76,        // how quickly the disk dims with radius
+    heatGain: 1.13,           // overall disk brightness
+    doppler: 0.48,            // one-sided brightening (0 = symmetric)
+
+    // --- Lensed halo (far side of the disk bent over/under the hole) ---
+    haloWidth: 0.85,          // thickness (x Rs)
+    haloSpin: 0.44,           // rotation speed
+    haloNoiseScale: [3.0, 4.0],
+    haloNoiseFloor: 0.4,      // minimum brightness of the halo swirls
+    haloBottom: 0.3,          // brightness under the hole (top = 1)
+    haloDoppler: 0.4,
+    haloGain: 1.05,
+
+    // --- Photon ring ---
+    ringRadius: 1.02,         // (x Rs)
+    ringWidth: 0.05,          // (x Rs), never thinner than ringMinCells
+    ringMinCells: 0.6,        // minimum width in character rows
+    ringGain: 0.85,
+
+    // --- Colour / glyph mapping ---
+    colourGain: 1.5,          // multiplies tint by intensity
+    hotColour: [1.0, 0.75, 0.45], // added to the brightest regions
+    hotThreshold: 0.55,       // intensity where the hot colour kicks in
+    hotPower: 1.5,
+    hotGain: 0.9,
+    glyphGain: 0.85,          // intensity -> glyph index scale
+
+    // --- Stars ---
+    starColour: [0.75, 0.82, 1.0],
+    starLensing: 2.2,         // strength of the lensing bend around the hole
+    starDrift: 0.004,         // backdrop rotation speed (rad/s)
+    starMinBright: 0.25,
+    twinkleDepth: 0.4,        // 0 = steady, 1 = fully blinking
+    twinkleSpeed: [0.8, 3.0], // [base, random extra] twinkle rate
+    starEdgeFade: 1.25,       // stars fade in from Rs to this (x Rs)
+    starDiskOcclusion: 3.0,   // how strongly the disk hides stars behind it
+    starGlyphCuts: [0.35, 0.65] // brightness thresholds between starGlyphs
+  };
+  // =====================================================================
+
+  const position = [0, 0];
+  const timeWrap = 21600; // seconds before time wraps (keeps float precision)
+  const currentSettings = { cfg, LOOK, position };
+  const defaults = JSON.stringify(currentSettings);
+  const storageKey = `ascii-black-hole:look:v1:${location.pathname}`;
+  let settingsNotice = '';
+  let hasSavedSettings = loadSettings();
+  const liveLook = debug || hasSavedSettings;
+
+  const layoutKeys = ['fontSize', 'glyphScale', 'charAspect', 'fontWeight', 'font', 'ramp'];
+  const lookUniforms = Object.keys(LOOK).filter((key) =>
+    typeof LOOK[key] !== 'string' && !layoutKeys.includes(key));
+  let ramp = [...LOOK.ramp];
+
+  function getBinding(path, settings) {
+    const [key, index] = path.split('.');
+    if (key === 'x' || key === 'y') return [settings.position, key === 'x' ? 0 : 1];
+    const target = Object.hasOwn(cfg, key) ? settings.cfg : settings.LOOK;
+    return index === undefined ? [target, key] : [target[key], +index];
+  }
+
+  function textSettingsError(ramp, stars, font) {
+    const glyphs = typeof ramp === 'string' ? [...ramp] : [];
+    if (glyphs.length < 2 || glyphs.length > 32 || !ramp.trim())
+      return 'Use 2 to 32 glyphs, including at least one visible glyph.';
+    if (typeof stars !== 'string' || [...stars].length !== 3 || ![...stars].every((c) => glyphs.includes(c)))
+      return 'Enter exactly three star glyphs from the ramp.';
+    if (typeof font !== 'string' || !font.trim()) return 'Enter a font family.';
+    return '';
+  }
+
+  function applySettings(settings) {
+    position.splice(0, 2, ...settings.position);
+    for (const group of ['cfg', 'LOOK']) {
+      const target = currentSettings[group];
+      for (const key of Object.keys(target)) {
+        const value = settings[group][key];
+        if (Array.isArray(value)) target[key].splice(0, value.length, ...value);
+        else target[key] = value;
+      }
+    }
+  }
+
+  function validateSettings(settings) {
+    const { cfg: savedCfg, LOOK: savedLook, position: savedPosition } = settings ?? {};
+    for (const [saved, original] of [[savedCfg, cfg], [savedLook, LOOK], [savedPosition, position]]) {
+      if (!saved || typeof saved !== 'object') throw new Error('Missing settings group.');
+      for (const [key, value] of Object.entries(original)) {
+        if (Array.isArray(value) && (!Array.isArray(saved[key]) || saved[key].length !== value.length))
+          throw new Error(`Invalid settings array: ${key}.`);
+      }
+    }
+    if (!Array.isArray(savedPosition) || savedPosition.length !== 2) throw new Error('Invalid position.');
+    for (const [path, , min, max] of Object.values(tunerGroups()).flat()) {
+      const [target, key] = getBinding(path, settings);
+      const value = target[key];
+      const values = min === undefined ? value : [path === 'fontWeight' && value === 'bold' ? 700 : value];
+      if (values.some((n) => !Number.isFinite(n) || n < (min ?? 0) || n > (max ?? 1)))
+        throw new Error(`Invalid setting: ${path}.`);
+    }
+    const error = textSettingsError(savedLook.ramp, savedLook.starGlyphs, savedLook.font);
+    if (error) throw new Error(error);
+    if (savedLook.diskInner >= savedLook.diskOuter || savedLook.starGlyphCuts[0] > savedLook.starGlyphCuts[1])
+      throw new Error('Saved disk radii or star thresholds are out of order.');
+  }
+
+  function loadSettings() {
+    try {
+      const stored = localStorage.getItem(storageKey);
+      if (stored === null) return false;
+      const settings = JSON.parse(stored);
+      validateSettings(settings);
+      applySettings(settings);
+      settingsNotice = 'Loaded saved settings.';
+      return true;
+    } catch (error) {
+      console.warn('Could not load black hole settings:', error);
+      settingsNotice = 'Could not load saved settings. Using defaults.';
+      return false;
+    }
+  }
+
+  function starGlyphIndices() {
+    return [...LOOK.starGlyphs].map((c) => Math.max(0, ramp.indexOf(c)));
+  }
+
+  function glslLook() {
+    if (liveLook) {
+      return lookUniforms.map((key) => {
+        const val = LOOK[key];
+        return `uniform ${Array.isArray(val) ? `vec${val.length}` : 'float'} ${key};`;
+      }).join('\n') + `
+        uniform vec3 starGlyphIdx;
+        uniform float glyphsM1;
+        uniform vec2 sceneOffset;
+        uniform vec3 phase;
+        #define DISK_PHASE phase.x
+        #define HALO_PHASE phase.y
+        #define STAR_PHASE phase.z`;
+    }
+    const f = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
+    const v = (a) => `vec${a.length}(${a.map(f).join(', ')})`;
+    const out = [];
+    for (const key of lookUniforms) {
+      const val = LOOK[key];
+      out.push(`#define ${key} ${Array.isArray(val) ? v(val) : f(val)}`);
+    }
+    out.push(`#define starGlyphIdx ${v(starGlyphIndices())}`,
+      `#define glyphsM1 ${f(ramp.length - 1)}`,
+      '#define sceneOffset vec2(0.0)',
+      '#define DISK_PHASE (uTime * uSpeed * diskSpin)',
+      '#define HALO_PHASE (uTime * uSpeed * haloSpin)',
+      '#define STAR_PHASE (uTime * starDrift)');
+    return out.join('\n');
+  }
+
+  // ---------- Shaders ----------
+  const VS = `
+    attribute vec2 aPos;
+    void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+  // Pass 1: one fragment per character cell -> rgb colour + glyph level in alpha.
+  const FS_SCENE = `
+    precision highp float;
+    ${glslLook()}
+    uniform vec2 uRes;
+    uniform vec2 uCell;
+    uniform float uTime;
+    uniform float uSpeed;
+    uniform float uStars;
+    uniform float uTilt;
+    uniform float uSize;
+    uniform vec3 uTint;
+
+    float hash(vec2 p) {
+      vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+      p3 += dot(p3, p3.yzx + 33.33);
+      return fract((p3.x + p3.y) * p3.z);
+    }
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+                 mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+    }
+
+    void main() {
+      vec2 px = (floor(gl_FragCoord.xy) + 0.5) * uCell;
+      float m = min(uRes.x, uRes.y);
+      vec2 p = (px - (0.5 + sceneOffset) * uRes) / m;
+      float d = length(p);
+      float cellN = uCell.y / m;
+
+      float Rs = shadowRadius * uSize;
+      float Rin = Rs * diskInner;
+      float Rout = Rs * diskOuter;
+
+      // --- Accretion disk (tilted, Keplerian differential rotation) ---
+      vec2 q = vec2(p.x, p.y / uTilt);
+      float r = max(length(q), 1e-4);
+      float ang = atan(q.y, q.x);
+      float a = ang - DISK_PHASE * pow(Rin / max(r, Rin), keplerPower);
+      float swirl = a + diskWhirl * log(r / Rin);
+      vec2 c = vec2(cos(swirl), sin(swirl));
+      float rn = r / Rs;
+      float n = noise(c * noiseScaleA.x + rn * noiseScaleA.y) * noiseMixA
+              + noise(c * noiseScaleB.x + rn * noiseScaleB.y) * (1.0 - noiseMixA);
+      float band = smoothstep(Rin, Rin * (1.0 + diskInnerSoftness), r)
+                 * (1.0 - smoothstep(Rout * diskOuterFadeStart, Rout, r));
+      float heat = pow(Rin / max(r, Rin), heatFalloff) * heatGain;
+      float beam = 1.0 + doppler * cos(ang);        // approaching side brighter
+      float disk = band * heat * (clumpFloor + clumpGain * n) * beam;
+      if (p.y > 0.0 && d < Rs) disk = 0.0;          // far half hidden behind the shadow
+
+      // --- Lensed image of the far disk wrapping over/under the shadow ---
+      float halo = 0.0;
+      float hr = (d - Rs * ringRadius) / (Rs * haloWidth);
+      if (hr > 0.0 && hr < 1.0) {
+        float ha = atan(p.y, p.x);
+        float hb = ha - HALO_PHASE;
+        vec2 hc = vec2(cos(hb), sin(hb));
+        float hn = noise(hc * haloNoiseScale.x + hr * haloNoiseScale.y) * (1.0 - haloNoiseFloor) + haloNoiseFloor;
+        float prof = smoothstep(0.0, 0.12, hr) * (1.0 - smoothstep(0.25, 1.0, hr));
+        float vert = haloBottom + (1.0 - haloBottom) * smoothstep(-0.4, 0.8, p.y / d);
+        halo = prof * hn * vert * (1.0 + haloDoppler * cos(ha)) * haloGain;
+      }
+
+      // --- Photon ring ---
+      float rw = max(Rs * ringWidth, cellN * ringMinCells);
+      float ringDist = (d - Rs * ringRadius) / rw;
+      float ring = exp(-ringDist * ringDist) * ringGain;
+
+      float I = disk + halo + ring;
+      vec3 col = uTint * I * colourGain + hotColour * pow(max(I - hotThreshold, 0.0), hotPower) * hotGain;
+      float lvl = clamp(I * glyphGain, 0.0, 1.0);
+
+      // --- Stars, lensed around the hole and slowly rotating ---
+      float k = Rs * Rs * starLensing;
+      vec2 sp = p * (1.0 - k / max(d * d, 1e-5)) + sceneOffset * uRes / m;
+      float rot = STAR_PHASE;
+      float cr = cos(rot), sr = sin(rot);
+      sp = mat2(cr, -sr, sr, cr) * sp;
+      vec2 g = floor(sp * m / uCell);
+      float h = hash(g);
+      if (h > 1.0 - uStars) {
+        float h2 = hash(g + 17.31);
+        float tw = sin(uTime * (twinkleSpeed.x + twinkleSpeed.y * h2) + h * 50.0);
+        float s = (starMinBright + (1.0 - starMinBright) * h2 * h2) * (1.0 - twinkleDepth + twinkleDepth * tw);
+        s *= smoothstep(Rs, Rs * starEdgeFade, d) * clamp(1.0 - I * starDiskOcclusion, 0.0, 1.0);
+        col += starColour * s;
+        float sl = s < starGlyphCuts.x ? starGlyphIdx.x : (s < starGlyphCuts.y ? starGlyphIdx.y : starGlyphIdx.z);
+        if (s > 0.05) lvl = max(lvl, sl / glyphsM1);
+      }
+
+      gl_FragColor = vec4(min(col, 1.0), lvl);
+    }`;
+
+  // Pass 2: per pixel, look up cell + glyph atlas.
+  const FS_ASCII = `
+    precision mediump float;
+    uniform sampler2D uScene;
+    uniform sampler2D uAtlas;
+    uniform vec2 uGrid;
+    uniform vec2 uCell;
+    uniform float uGlyphs;
+    void main() {
+      vec2 cp = gl_FragCoord.xy / uCell;
+      vec2 cell = floor(cp);
+      vec4 s = texture2D(uScene, (cell + 0.5) / uGrid);
+      float gi = floor(s.a * (uGlyphs - 1.0) + 0.5);
+      vec2 l = fract(cp);
+      float mask = texture2D(uAtlas, vec2((gi + l.x) / uGlyphs, 1.0 - l.y)).a;
+      gl_FragColor = vec4(s.rgb * mask, 1.0);
+    }`;
+
+  // ---------- WebGL setup ----------
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl', {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    preserveDrawingBuffer: false, powerPreference: 'low-power'
+  });
+  if (!gl) {
+    document.body.style.color = '#f33';
+    document.body.textContent = 'WebGL is not available.';
+    return;
+  }
+
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  function program(fs, uniforms) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'aPos');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {};
+    for (const n of uniforms) u[n] = gl.getUniformLocation(p, n);
+    return { p, u };
+  }
+
+  const scene = program(FS_SCENE, [
+    'uRes', 'uCell', 'uTime', 'uSpeed', 'uStars', 'uTilt', 'uSize', 'uTint',
+    ...(liveLook ? [...lookUniforms, 'starGlyphIdx', 'glyphsM1', 'sceneOffset', 'phase'] : [])
+  ]);
+  const ascii = program(FS_ASCII, ['uScene', 'uAtlas', 'uGrid', 'uCell', 'uGlyphs']);
+
+  // Single fullscreen triangle, shared by both passes.
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  function makeTex(unit) {
+    const t = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  // Unit 0 = scene (cell) texture, unit 1 = glyph atlas. Bindings stay fixed.
+  const sceneTex = makeTex(0);
+  makeTex(1);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  gl.useProgram(ascii.p);
+  gl.uniform1i(ascii.u.uScene, 0);
+  gl.uniform1i(ascii.u.uAtlas, 1);
+
+  // ---------- Layout / atlas ----------
+  let W = 0, H = 0, cw = 0, ch = 0, cols = 0, rows = 0;
+  const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+
+  function buildAtlas() {
+    ramp = [...LOOK.ramp];
+    const c2 = document.createElement('canvas');
+    c2.width = cw * ramp.length;
+    c2.height = ch;
+    const x = c2.getContext('2d');
+    x.fillStyle = '#fff';
+    x.textAlign = 'center';
+    x.textBaseline = 'middle';
+    x.font = `${LOOK.fontWeight} ${Math.round(ch * LOOK.glyphScale)}px ${LOOK.font}`;
+    for (let i = 0; i < ramp.length; i++) {
+      const args = [ramp[i], i * cw + cw / 2, ch / 2 + 1];
+      if (liveLook) args.push(cw);
+      x.fillText(...args);
+    }
+    gl.activeTexture(gl.TEXTURE1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c2);
+    c2.width = c2.height = 0; // release the temporary canvas backing store
+  }
+
+  function layout() {
+    const dpr = window.devicePixelRatio || 1;
+    W = Math.max(1, Math.floor(window.innerWidth * dpr));
+    H = Math.max(1, Math.floor(window.innerHeight * dpr));
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+    ch = Math.max(6, Math.round(cfg.fontSize * dpr));
+    cw = Math.min(Math.floor(maxTextureSize / [...LOOK.ramp].length), Math.max(4, Math.round(ch * LOOK.charAspect)));
+    const nextCols = Math.ceil(W / cw);
+    const nextRows = Math.ceil(H / ch);
+    if (nextCols !== cols || nextRows !== rows) {
+      cols = nextCols;
+      rows = nextRows;
+      gl.activeTexture(gl.TEXTURE0);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+    buildAtlas();
+
+    gl.useProgram(scene.p);
+    gl.uniform2f(scene.u.uRes, W, H);
+    gl.uniform2f(scene.u.uCell, cw, ch);
+    gl.useProgram(ascii.p);
+    gl.uniform1f(ascii.u.uGlyphs, ramp.length);
+    gl.uniform2f(ascii.u.uGrid, cols, rows);
+    gl.uniform2f(ascii.u.uCell, cw, ch);
+    applyStatic();
+  }
+
+  function applyStatic() {
+    gl.useProgram(scene.p);
+    gl.uniform1f(scene.u.uSpeed, cfg.speed);
+    gl.uniform1f(scene.u.uStars, cfg.stars);
+    gl.uniform1f(scene.u.uTilt, cfg.tilt);
+    gl.uniform1f(scene.u.uSize, cfg.size);
+    gl.uniform3f(scene.u.uTint, cfg.tint[0], cfg.tint[1], cfg.tint[2]);
+    if (liveLook) {
+      for (const key of lookUniforms) {
+        const val = LOOK[key];
+        if (Array.isArray(val)) gl[`uniform${val.length}fv`](scene.u[key], val);
+        else gl.uniform1f(scene.u[key], val);
+      }
+      gl.uniform3fv(scene.u.starGlyphIdx, starGlyphIndices());
+      gl.uniform1f(scene.u.glyphsM1, ramp.length - 1);
+      gl.uniform2f(scene.u.sceneOffset, position[0], -position[1]);
+    }
+  }
+
+  // ---------- Render loop ----------
+  let raf = 0, last = 0, lastRender = 0, simTime = 0, paused = false, needsLayout = true;
+  let settingsDirty = false;
+  const phase = [0, 0, 0];
+
+  function frame(now) {
+    raf = requestAnimationFrame(frame);
+    const interval = 1000 / cfg.fps;
+    const dt = now - last;
+    if (dt < interval - 1) return;
+    last = dt < interval ? now : now - (dt % interval);
+    const elapsed = (now - lastRender) / 1000;
+    lastRender = now;
+    simTime = (simTime + elapsed) % timeWrap;
+    if (liveLook) {
+      const turn = 2 * Math.PI;
+      phase[0] = simTime < elapsed ? 0 : phase[0] + elapsed * cfg.speed * LOOK.diskSpin;
+      phase[1] = (phase[1] + elapsed * cfg.speed * LOOK.haloSpin) % turn;
+      phase[2] = (phase[2] + elapsed * LOOK.starDrift) % turn;
+    }
+
+    if (needsLayout) { needsLayout = false; layout(); }
+    else if (settingsDirty) applyStatic();
+    settingsDirty = false;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, cols, rows);
+    gl.useProgram(scene.p);
+    gl.uniform1f(scene.u.uTime, simTime);
+    if (liveLook) gl.uniform3fv(scene.u.phase, phase);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(ascii.p);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function start() {
+    if (!raf && !paused && !document.hidden) { last = lastRender = performance.now(); raf = requestAnimationFrame(frame); }
+  }
+  function stop() {
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  }
+
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { needsLayout = true; }, 150);
+  });
+  document.addEventListener('visibilitychange', () => (document.hidden ? stop() : start()));
+  canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); stop(); });
+  canvas.addEventListener('webglcontextrestored', () => location.reload());
+
+  // ---------- Lively hooks ----------
+  function hexToRgb(hex) {
+    const v = parseInt(String(hex).replace('#', '').slice(0, 6), 16);
+    return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
+  }
+
+  window.livelyPropertyListener = (name, val) => {
+    // Lively sends its own property values on startup; don't overwrite a saved look.
+    if (hasSavedSettings) return;
+    switch (name) {
+      case 'fps': cfg.fps = Math.max(5, +val); break;
+      case 'fontSize': cfg.fontSize = Math.max(6, +val); needsLayout = true; break;
+      case 'speed': cfg.speed = +val; break;
+      case 'stars': cfg.stars = +val / 1000; break;
+      case 'tilt': cfg.tilt = Math.max(0.02, +val / 100); break;
+      case 'size': cfg.size = +val / 100; break;
+      case 'diskColor': cfg.tint.splice(0, 3, ...hexToRgb(val)); break;
+      default: return;
+    }
+    applyStatic();
+  };
+
+  window.livelyWallpaperPlaybackChanged = (data) => {
+    try { paused = !!JSON.parse(data).IsPaused; } catch (_) { paused = false; }
+    paused ? stop() : start();
+  };
+
+  function tunerGroups() {
+    return {
+      'Placement and motion': [
+        ['x', 'Horizontal position', -0.5, 0.5, 0.005],
+        ['y', 'Vertical position', -0.5, 0.5, 0.005],
+        ['size', 'Black hole scale', 0.25, 3, 0.01],
+        ['tilt', 'Disk tilt', 0.02, 1, 0.01],
+        ['speed', 'Rotation speed', 0, 4, 0.01],
+        ['fps', 'FPS limit', 5, 120, 1]
+      ],
+      'Characters': [
+        ['fontSize', 'Row height (px)', 6, 40, 0.5],
+        ['glyphScale', 'Glyph height / row height', 0.2, 1.5, 0.01],
+        ['charAspect', 'Cell width / row height', 0.2, 1.2, 0.01],
+        ['fontWeight', 'Font weight', 100, 900, 100]
+      ],
+      'Disk geometry': [
+        ['shadowRadius', 'Shadow radius / screen', 0.02, 0.45, 0.005],
+        ['diskInner', 'Inner radius', 0.5, 7.95, 0.05],
+        ['diskOuter', 'Outer radius', 0.55, 8, 0.05],
+        ['diskInnerSoftness', 'Inner edge softness', 0.01, 1, 0.01],
+        ['diskOuterFadeStart', 'Outer fade start', 0.01, 0.99, 0.01]
+      ],
+      'Disk texture and light': [
+        ['diskSpin', 'Disk spin', -4, 4, 0.01],
+        ['keplerPower', 'Differential rotation', 0, 3, 0.01],
+        ['diskWhirl', 'Spiral winding', -8, 8, 0.05],
+        ['noiseScaleA.0', 'Coarse angular frequency', 0, 24, 0.05],
+        ['noiseScaleA.1', 'Coarse radial frequency', 0, 24, 0.05],
+        ['noiseScaleB.0', 'Fine angular frequency', 0, 24, 0.05],
+        ['noiseScaleB.1', 'Fine radial frequency', 0, 24, 0.05],
+        ['noiseMixA', 'Coarse texture mix', 0, 1, 0.01],
+        ['clumpFloor', 'Swirl base brightness', 0, 2, 0.01],
+        ['clumpGain', 'Swirl contrast', 0, 3, 0.01],
+        ['heatFalloff', 'Radial brightness falloff', 0, 5, 0.01],
+        ['heatGain', 'Disk brightness', 0, 4, 0.01],
+        ['doppler', 'Disk side brightening', 0, 1, 0.01]
+      ],
+      'Lensed halo': [
+        ['haloWidth', 'Halo width', 0.01, 4, 0.01],
+        ['haloSpin', 'Halo spin', -4, 4, 0.01],
+        ['haloNoiseScale.0', 'Angular frequency', 0, 24, 0.05],
+        ['haloNoiseScale.1', 'Radial frequency', 0, 24, 0.05],
+        ['haloNoiseFloor', 'Swirl base brightness', 0, 1, 0.01],
+        ['haloBottom', 'Underside brightness', 0, 1, 0.01],
+        ['haloDoppler', 'Halo side brightening', 0, 1, 0.01],
+        ['haloGain', 'Halo brightness', 0, 4, 0.01]
+      ],
+      'Photon ring': [
+        ['ringRadius', 'Ring radius', 0.5, 2, 0.01],
+        ['ringWidth', 'Ring width', 0.005, 0.5, 0.005],
+        ['ringMinCells', 'Minimum width (rows)', 0, 3, 0.01],
+        ['ringGain', 'Ring brightness', 0, 4, 0.01]
+      ],
+      'Colour and glyph mapping': [
+        ['tint', 'Disk tint'],
+        ['colourGain', 'Base colour gain', 0, 4, 0.01],
+        ['hotColour', 'Hot-region colour'],
+        ['hotThreshold', 'Hot-region threshold', 0, 3, 0.01],
+        ['hotPower', 'Hot-region contrast', 0.1, 5, 0.01],
+        ['hotGain', 'Hot-region brightness', 0, 4, 0.01],
+        ['glyphGain', 'Glyph intensity gain', 0, 3, 0.01]
+      ],
+      'Stars': [
+        ['stars', 'Star density', 0, 0.2, 0.001],
+        ['starColour', 'Star colour'],
+        ['starLensing', 'Lensing strength', 0, 8, 0.01],
+        ['starDrift', 'Drift (rad/s)', -0.1, 0.1, 0.0005],
+        ['starMinBright', 'Base star brightness', 0, 1, 0.01],
+        ['twinkleDepth', 'Twinkle depth', 0, 0.5, 0.01],
+        ['twinkleSpeed.0', 'Base twinkle rate', 0, 10, 0.05],
+        ['twinkleSpeed.1', 'Twinkle rate variation', 0, 10, 0.05],
+        ['starEdgeFade', 'Inner star fade radius', 1.01, 4, 0.01],
+        ['starDiskOcclusion', 'Disk occlusion', 0, 10, 0.05],
+        ['starGlyphCuts.0', 'Medium glyph threshold', 0, 1, 0.01],
+        ['starGlyphCuts.1', 'Bright glyph threshold', 0, 1, 0.01]
+      ]
+    };
+  }
+
+  function addTuner() {
+    const panel = document.createElement('aside');
+    panel.id = 'tuner';
+    panel.setAttribute('aria-label', 'Black hole tuner');
+    panel.innerHTML = `
+      <header>
+        <strong class="grab" title="Drag to move the panel">Black hole tuner</strong>
+        <button type="button" class="save">Save</button>
+        <button type="button" class="reset">Defaults</button>
+        <button type="button" class="toggle" aria-expanded="true" aria-controls="tuner-controls">Hide</button>
+      </header>
+      <div class="controls" id="tuner-controls">
+        <p>Drag the title to move the panel. Sliders update the scene live. Radii are in shadow radii unless noted.</p>
+        <p>Save keeps the current look in this browser. Defaults removes the saved look.</p>
+      </div>
+      <p class="settings-status" role="status"></p>`;
+    document.body.append(panel);
+    const controls = panel.querySelector('.controls');
+    const settingsStatus = panel.querySelector('.settings-status');
+    settingsStatus.textContent = settingsNotice;
+    const refresh = [];
+    let resetText;
+
+    for (const [title, specs] of Object.entries(tunerGroups())) {
+      const section = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = title;
+      section.open = title === 'Placement and motion';
+      section.append(summary);
+      controls.append(section);
+
+      for (const [path, title, min, max, step = 0.01] of specs) {
+        const [target, key] = getBinding(path, currentSettings);
+        const channels = min === undefined ? ['red', 'green', 'blue'] : [''];
+        for (const [index, channel] of channels.entries()) {
+          const label = document.createElement('label');
+          const caption = document.createElement('span');
+          const value = document.createElement('output');
+          const input = document.createElement('input');
+          caption.textContent = channel ? `${title} ${channel}` : title;
+          caption.id = `tuner-${path}-${index}-name`;
+          input.id = `tuner-${path}-${index}`;
+          input.type = 'range';
+          input.min = min ?? 0;
+          input.max = max ?? 1;
+          input.step = step;
+          input.setAttribute('aria-labelledby', caption.id);
+          value.htmlFor = input.id;
+          label.append(caption, value, input);
+          section.append(label);
+          const sync = () => {
+            const current = channel ? target[key][index] : target[key];
+            input.value = current === 'bold' ? 700 : current;
+            value.value = input.value;
+          };
+          refresh.push(sync);
+          sync();
+          input.addEventListener('input', () => {
+            if (channel) target[key][index] = input.valueAsNumber;
+            else target[key] = input.valueAsNumber;
+            if (path === 'diskInner' && LOOK.diskInner >= LOOK.diskOuter)
+              LOOK.diskOuter = Number((LOOK.diskInner + 0.05).toFixed(2));
+            if (path === 'diskOuter' && LOOK.diskOuter <= LOOK.diskInner)
+              LOOK.diskInner = Number((LOOK.diskOuter - 0.05).toFixed(2));
+            if (path === 'starGlyphCuts.0' && LOOK.starGlyphCuts[0] > LOOK.starGlyphCuts[1])
+              LOOK.starGlyphCuts[1] = LOOK.starGlyphCuts[0];
+            if (path === 'starGlyphCuts.1' && LOOK.starGlyphCuts[1] < LOOK.starGlyphCuts[0])
+              LOOK.starGlyphCuts[0] = LOOK.starGlyphCuts[1];
+            refresh.forEach((update) => update());
+            if (layoutKeys.includes(path)) needsLayout = true;
+            else settingsDirty = true;
+          });
+        }
+      }
+
+      if (title === 'Characters') {
+        const form = document.createElement('form');
+        form.innerHTML = `
+          <label>Glyph ramp (dim to bright)<input name="ramp" type="text" spellcheck="false"></label>
+          <label>Star glyphs (faint to bright)<input name="starGlyphs" type="text" spellcheck="false"></label>
+          <label>Font family<input name="font" type="text" spellcheck="false" required></label>
+          <button type="submit">Apply text settings</button>
+          <p role="status"></p>`;
+        section.append(form);
+        const textKeys = ['ramp', 'starGlyphs', 'font'];
+        const status = form.querySelector('[role="status"]');
+        resetText = () => {
+          textKeys.forEach((key) => { form.elements.namedItem(key).value = LOOK[key]; });
+          status.textContent = '';
+        };
+        resetText();
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          const [nextRamp, nextStars, font] = textKeys.map((key) => form.elements.namedItem(key).value);
+          const error = textSettingsError(nextRamp, nextStars, font);
+          if (error) status.textContent = error;
+          else {
+            Object.assign(LOOK, { ramp: nextRamp, starGlyphs: nextStars, font: font.trim() });
+            needsLayout = true;
+            status.textContent = 'Text settings applied.';
+          }
+        });
+      }
+    }
+
+    panel.querySelector('.save').addEventListener('click', () => {
+      try {
+        validateSettings(currentSettings);
+        localStorage.setItem(storageKey, JSON.stringify(currentSettings));
+        hasSavedSettings = true;
+        settingsStatus.textContent = 'Saved. This look will load automatically.';
+      } catch (error) {
+        console.warn('Could not save black hole settings:', error);
+        settingsStatus.textContent = `Could not save settings. ${error.message}`;
+      }
+    });
+
+    panel.querySelector('.reset').addEventListener('click', () => {
+      applySettings(JSON.parse(defaults));
+      phase.fill(0);
+      simTime = 0;
+      needsLayout = true;
+      refresh.forEach((update) => update());
+      resetText();
+      try {
+        localStorage.removeItem(storageKey);
+        hasSavedSettings = false;
+        settingsStatus.textContent = 'Defaults restored and saved look removed.';
+      } catch (error) {
+        console.warn('Could not remove saved black hole settings:', error);
+        settingsStatus.textContent = 'Defaults restored for now, but the saved look could not be removed.';
+      }
+    });
+
+    const toggle = panel.querySelector('.toggle');
+    toggle.addEventListener('click', () => {
+      controls.hidden = !controls.hidden;
+      toggle.textContent = controls.hidden ? 'Show' : 'Hide';
+      toggle.setAttribute('aria-expanded', String(!controls.hidden));
+      place(panel.offsetLeft, panel.offsetTop);
+    });
+
+    const handle = panel.querySelector('.grab');
+    let drag = null;
+    function place(x, y) {
+      panel.style.left = `${Math.max(0, Math.min(x, innerWidth - panel.offsetWidth))}px`;
+      panel.style.top = `${Math.max(0, Math.min(y, innerHeight - panel.offsetHeight))}px`;
+    }
+    handle.addEventListener('pointerdown', (event) => {
+      if (!event.isPrimary || event.button !== 0) return;
+      drag = [event.clientX - panel.offsetLeft, event.clientY - panel.offsetTop];
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener('pointermove', (event) => {
+      if (drag && handle.hasPointerCapture(event.pointerId)) place(event.clientX - drag[0], event.clientY - drag[1]);
+    });
+    handle.addEventListener('lostpointercapture', () => { drag = null; });
+    window.addEventListener('resize', () => place(panel.offsetLeft, panel.offsetTop));
+    new ResizeObserver(() => place(panel.offsetLeft, panel.offsetTop)).observe(panel);
+  }
+
+  if (debug) addTuner();
+  start();
+})();
+</script>
+</body>
+</html>
